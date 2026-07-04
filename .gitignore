@@ -1,0 +1,19 @@
+# Build output
+/target/
+
+# Cargo lock for binary projects (uncomment if this is a library)
+# Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Debug files
+*.pdb
