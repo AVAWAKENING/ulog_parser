@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use evalexpr::*;
 use px4_ulog::full_parser::{self, MultiId, SomeVec};
 
 /// 将 time_utc_usec（微秒级 UTC 时间戳）转换为北京时间字符串 (YYYY-MM-DD HH:MM:SS.ffffff)
@@ -14,7 +15,6 @@ fn usec_to_beijing_time(usec: u64) -> String {
     let hour = time_of_day / 3600;
     let minute = (time_of_day % 3600) / 60;
     let second = time_of_day % 60;
-    // 从 1970-01-01 计算年月日
     let (year, month, day) = days_to_ymd(days);
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}",
@@ -54,8 +54,86 @@ fn is_leap(y: u64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
-/// "消息名&字段名" 的键，如 "vehicle_gps_position&lat"
-pub type FieldKey = String;
+/// 一条规则：输出字段名 = 表达式
+#[derive(Debug, Clone)]
+pub struct Rule {
+    /// 输出字段名（等号左边）
+    pub output_name: String,
+    /// 原始表达式文本（等号右边）
+    pub expression: String,
+    /// 是否为简单字段引用（仅含字母、数字、下划线，无运算符）
+    pub is_simple_ref: bool,
+}
+
+/// 规则集合：消息名 -> 规则列表
+pub type Rules = BTreeMap<String, Vec<Rule>>;
+
+/// 判断表达式是否为简单字段引用
+fn is_simple_field_ref(expr: &str) -> bool {
+    !expr.is_empty()
+        && expr
+            .chars()
+            .next()
+            .map(|c| c.is_alphabetic() || c == '_')
+            .unwrap_or(false)
+        && expr.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// 解析 rules.txt 文件
+///
+/// 文件格式：
+/// ```text
+/// message_name:
+///     output_field=expression
+///     another_field=some_var
+/// ```
+///
+/// 以 `#` 开头的行为注释，空行被忽略。
+/// 消息头行以 `:` 结尾，后续缩进行为该消息的规则。
+pub fn parse_rules_file(path: &std::path::Path) -> Result<Rules, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("无法读取规则文件 {}: {}", path.display(), e))?;
+
+    let mut rules: Rules = BTreeMap::new();
+    let mut current_msg: Option<String> = None;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        // 跳过空行和注释
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        if trimmed.ends_with(':') {
+            // 消息头行
+            let msg_name = trimmed.trim_end_matches(':').trim().to_string();
+            current_msg = Some(msg_name);
+        } else if let Some(msg) = &current_msg {
+            // 规则行：输出字段名=表达式
+            if let Some((output_name, expression)) = trimmed.split_once('=') {
+                let output_name = output_name.trim().to_string();
+                let expression = expression.trim().to_string();
+                rules.entry(msg.clone()).or_default().push(Rule {
+                    output_name,
+                    is_simple_ref: is_simple_field_ref(&expression),
+                    expression,
+                });
+            }
+        }
+    }
+
+    Ok(rules)
+}
+
+/// 获取可执行文件目录下的 rules.txt 路径
+pub fn get_rules_path() -> PathBuf {
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(parent) = exe_path.parent() {
+            return parent.join("rules.txt");
+        }
+    }
+    PathBuf::from("rules.txt")
+}
 
 /// 扫描源目录，找到所有 .ulg / .ulog 文件
 pub fn find_ulog_files(dir: &std::path::Path) -> Vec<PathBuf> {
@@ -73,45 +151,6 @@ pub fn find_ulog_files(dir: &std::path::Path) -> Vec<PathBuf> {
     }
     files.sort();
     files
-}
-
-/// 解析一个 ulog 文件，提取所有消息名&字段名
-pub fn extract_field_keys(path: &std::path::Path) -> Result<BTreeMap<String, Vec<String>>, String> {
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| "路径包含非法字符".to_string())?;
-    let parsed = full_parser::read_file(path_str).map_err(|e| format!("解析失败: {}", e))?;
-
-    let mut keys: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (msg_name, multi_map) in &parsed.messages {
-        // 跳过 "event" 消息
-        if msg_name == "event" {
-            continue;
-        }
-        // 取第一个实例 (MultiId=0) 来获取字段列表
-        if let Some(fields) = multi_map.get(&MultiId::new(0)) {
-            let mut field_names: Vec<String> = fields.keys().cloned().collect();
-            field_names.sort();
-            keys.insert(msg_name.clone(), field_names);
-        }
-    }
-    Ok(keys)
-}
-
-/// 合并字段 keys（取并集）
-pub fn merge_field_keys(
-    base: &mut BTreeMap<String, Vec<String>>,
-    new: BTreeMap<String, Vec<String>>,
-) {
-    for (msg, fields) in new {
-        let entry = base.entry(msg).or_default();
-        for f in fields {
-            if !entry.contains(&f) {
-                entry.push(f);
-            }
-        }
-        entry.sort();
-    }
 }
 
 /// 将 SomeVec 中的第 i 个值格式化为字符串
@@ -151,260 +190,121 @@ pub fn some_vec_len(vec: &SomeVec) -> usize {
     }
 }
 
-/// 导出一个 ulog 文件的选中字段到 CSV
-pub fn export_ulog_to_csv(
+/// 根据 rules.txt 规则导出 ulog 文件到 CSV
+///
+/// 每个 (ulog文件, 消息) 组合生成一个 CSV 文件，文件名为 `{ulog_stem}_{message_name}.csv`。
+/// 表达式中可使用 evalexpr 支持的数学函数（sqrt, sin, cos 等）和 `^` 运算符。
+/// 内置自定义函数 `beijing_time(x)` 可将微秒 UTC 时间戳转换为北京时间字符串。
+pub fn export_ulog_with_rules(
     path: &std::path::Path,
     dest_dir: &std::path::Path,
-    selected: &[FieldKey],
-) -> Result<String, String> {
+    rules: &Rules,
+) -> Result<Vec<String>, String> {
     let path_str = path
         .to_str()
         .ok_or_else(|| "路径包含非法字符".to_string())?;
     let parsed = full_parser::read_file(path_str).map_err(|e| format!("解析失败: {}", e))?;
 
-    // 按消息名分组选中的字段
-    let mut msg_fields: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for key in selected {
-        let parts: Vec<&str> = key.splitn(2, '&').collect();
-        if parts.len() == 2 {
-            let entry = msg_fields.entry(parts[0].to_string()).or_default();
-            if !entry.contains(&parts[1].to_string()) {
-                entry.push(parts[1].to_string());
-            }
-        }
-    }
-
-    // 生成 CSV 文件名
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("output");
-    let csv_path = dest_dir.join(format!("{}.csv", stem));
+    let mut generated_files = Vec::new();
 
-    let mut wtr =
-        csv::Writer::from_path(&csv_path).map_err(|e| format!("无法创建 CSV 文件: {}", e))?;
-
-    // 写表头：timestamp + 各选中字段的全名（字段名&消息名），按选择顺序排列
-    let mut headers = vec!["timestamp".to_string()];
-    let header_display: Vec<String> = selected
-        .iter()
-        .map(|k| {
-            let parts: Vec<&str> = k.splitn(2, '&').collect();
-            if parts.len() == 2 {
-                format!("{}&{}", parts[1], parts[0])
-            } else {
-                k.clone()
-            }
-        })
-        .collect();
-    headers.extend(header_display.iter().cloned());
-
-    // 记录 time_utc_usec 列位置及其对应的北京时间列位置
-    let mut utc_usec_cols: Vec<(usize, usize)> = Vec::new();
-    {
-        // 先收集所有 time_utc_usec 列的索引（从后往前插入，避免索引偏移）
-        let mut utc_indices: Vec<usize> = Vec::new();
-        for (idx, h) in headers.iter().enumerate() {
-            if h.starts_with("time_utc_usec&") {
-                utc_indices.push(idx);
-            }
-        }
-        // 从后往前插入北京时间列
-        for &utc_idx in utc_indices.iter().rev() {
-            let beijing_header = format!(
-                "time_utc_usec_beijing&{}",
-                headers[utc_idx].split('&').nth(1).unwrap_or("")
-            );
-            headers.insert(utc_idx + 1, beijing_header);
-        }
-        // 插入完成后，重新收集 (utc_col, beijing_col) 位置对
-        let mut i = 0;
-        while i < headers.len() {
-            if headers[i].starts_with("time_utc_usec&") && i + 1 < headers.len() {
-                utc_usec_cols.push((i, i + 1));
-                i += 2;
-            } else {
-                i += 1;
-            }
-        }
-    }
-
-    // 记录 ground_speed 计算列的位置：(vn_m_s列, ve_m_s列, ground_speed列)
-    let mut ground_speed_cols: Vec<(usize, usize, usize)> = Vec::new();
-    {
-        // 找出同时包含 vn_m_s 和 ve_m_s 的消息
-        let mut msg_has_vn_ve: Vec<String> = Vec::new();
-        for (msg_name, field_names) in &msg_fields {
-            if field_names.iter().any(|f| f == "vn_m_s") && field_names.iter().any(|f| f == "ve_m_s") {
-                msg_has_vn_ve.push(msg_name.clone());
-            }
-        }
-        // 从后往前为这些消息插入 ground_speed 列（在 ve_m_s 之后）
-        let mut ve_indices: Vec<usize> = Vec::new();
-        for msg in &msg_has_vn_ve {
-            let ve_header = format!("ve_m_s&{}", msg);
-            if let Some(idx) = headers.iter().position(|h| h == &ve_header) {
-                ve_indices.push(idx);
-            }
-        }
-        for &ve_idx in ve_indices.iter().rev() {
-            let msg_name = headers[ve_idx].split('&').nth(1).unwrap_or("");
-            let gs_header = format!("ground_speed&{}", msg_name);
-            headers.insert(ve_idx + 1, gs_header);
-        }
-        // 收集最终列位置
-        for msg in &msg_has_vn_ve {
-            let vn_header = format!("vn_m_s&{}", msg);
-            let ve_header = format!("ve_m_s&{}", msg);
-            let gs_header = format!("ground_speed&{}", msg);
-            if let (Some(vn_col), Some(ve_col), Some(gs_col)) = (
-                headers.iter().position(|h| h == &vn_header),
-                headers.iter().position(|h| h == &ve_header),
-                headers.iter().position(|h| h == &gs_header),
-            ) {
-                ground_speed_cols.push((vn_col, ve_col, gs_col));
-            }
-        }
-    }
-
-    wtr.write_record(&headers)
-        .map_err(|e| format!("写入表头失败: {}", e))?;
-
-    // 收集所有数据行，按 timestamp 排序
-    // 每行: (timestamp, [field_values...])
-    let mut rows: Vec<(u64, Vec<String>)> = Vec::new();
-
-    for (msg_name, field_names) in &msg_fields {
+    for (msg_name, rule_list) in rules {
+        // 获取消息数据
         let multi_map = match parsed.messages.get(msg_name) {
             Some(m) => m,
             None => continue,
         };
-        // 只取 MultiId=0 的实例
         let fields = match multi_map.get(&MultiId::new(0)) {
             Some(f) => f,
             None => continue,
         };
 
         // 获取行数
-        let row_count = field_names
+        let row_count = fields.values().map(some_vec_len).max().unwrap_or(0);
+        if row_count == 0 {
+            continue;
+        }
+
+        // 创建 CSV 文件
+        let csv_filename = format!("{}_{}.csv", stem, msg_name);
+        let csv_path = dest_dir.join(&csv_filename);
+        let mut wtr =
+            csv::Writer::from_path(&csv_path).map_err(|e| format!("无法创建 CSV 文件: {}", e))?;
+
+        // 写入表头
+        let headers: Vec<&str> = rule_list.iter().map(|r| r.output_name.as_str()).collect();
+        wtr.write_record(&headers)
+            .map_err(|e| format!("写入表头失败: {}", e))?;
+
+        // 预编译非简单引用的表达式
+        let compiled: Vec<Option<Node>> = rule_list
             .iter()
-            .filter_map(|f| fields.get(f))
-            .map(some_vec_len)
-            .max()
-            .unwrap_or(0);
-
-        // 获取 timestamp 列
-        let timestamps: Vec<u64> = match fields.get("timestamp") {
-            Some(SomeVec::UInt64(v)) => v.clone(),
-            Some(SomeVec::Int64(v)) => v.iter().map(|&x| x as u64).collect(),
-            _ => (0..row_count as u64).collect(),
-        };
-
-        // 检查此消息是否包含 time_utc_usec 字段
-        let has_utc_usec = field_names.iter().any(|f| f == "time_utc_usec");
-        let utc_usec_vec: Option<&SomeVec> = if has_utc_usec {
-            fields.get("time_utc_usec")
-        } else {
-            None
-        };
-
-        for i in 0..row_count {
-            let ts = timestamps.get(i).copied().unwrap_or(i as u64);
-
-            // 如果 rows 还没有这一行（按 timestamp），就初始化
-            let row_idx = rows.iter().position(|(t, _)| *t == ts);
-            match row_idx {
-                Some(idx) => {
-                    // 填充这个消息的字段值
-                    for field_name in field_names {
-                        let header_name = format!("{}&{}", field_name, msg_name);
-                        let col_idx = headers.iter().position(|h| h == &header_name).unwrap();
-                        if let Some(some_vec) = fields.get(field_name) {
-                            rows[idx].1[col_idx] = some_vec_to_string(some_vec, i);
-                        }
-                    }
-                    // 如果有 time_utc_usec，填充北京时间列
-                    if let Some(some_vec) = utc_usec_vec {
-                        let utc_usec_val = match some_vec {
-                            SomeVec::UInt64(v) => v.get(i).copied(),
-                            SomeVec::Int64(v) => v.get(i).map(|&x| x as u64),
-                            SomeVec::UInt32(v) => v.get(i).map(|&x| x as u64),
-                            SomeVec::Int32(v) => v.get(i).map(|&x| x as u64),
-                            _ => None,
-                        };
-                        if let Some(usec) = utc_usec_val {
-                            let header_name = format!("time_utc_usec&{}", msg_name);
-                            if let Some(utc_col) = headers.iter().position(|h| h == &header_name) {
-                                for &(utc_idx, bj_idx) in &utc_usec_cols {
-                                    if utc_idx == utc_col {
-                                        rows[idx].1[bj_idx] = usec_to_beijing_time(usec);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // 如果有 vn_m_s 和 ve_m_s，计算并填充 ground_speed 列
-                    for &(vn_col, ve_col, gs_col) in &ground_speed_cols {
-                        let vn_str = &rows[idx].1[vn_col];
-                        let ve_str = &rows[idx].1[ve_col];
-                        if let (Ok(vn), Ok(ve)) = (vn_str.parse::<f64>(), ve_str.parse::<f64>()) {
-                            rows[idx].1[gs_col] = format!("{:.6}", (vn * vn + ve * ve).sqrt());
-                        }
-                    }
+            .map(|rule| {
+                if rule.is_simple_ref {
+                    None
+                } else {
+                    evalexpr::build_operator_tree(&rule.expression).ok()
                 }
-                None => {
-                    let mut row = vec![String::new(); headers.len()];
-                    row[0] = ts.to_string();
-                    for field_name in field_names {
-                        let header_name = format!("{}&{}", field_name, msg_name);
-                        let col_idx = headers.iter().position(|h| h == &header_name).unwrap();
-                        if let Some(some_vec) = fields.get(field_name) {
-                            row[col_idx] = some_vec_to_string(some_vec, i);
-                        }
-                    }
-                    // 如果有 time_utc_usec，填充北京时间列
-                    if let Some(some_vec) = utc_usec_vec {
-                        let utc_usec_val = match some_vec {
-                            SomeVec::UInt64(v) => v.get(i).copied(),
-                            SomeVec::Int64(v) => v.get(i).map(|&x| x as u64),
-                            SomeVec::UInt32(v) => v.get(i).map(|&x| x as u64),
-                            SomeVec::Int32(v) => v.get(i).map(|&x| x as u64),
-                            _ => None,
-                        };
-                        if let Some(usec) = utc_usec_val {
-                            let header_name = format!("time_utc_usec&{}", msg_name);
-                            if let Some(utc_col) = headers.iter().position(|h| h == &header_name) {
-                                for &(utc_idx, bj_idx) in &utc_usec_cols {
-                                    if utc_idx == utc_col {
-                                        row[bj_idx] = usec_to_beijing_time(usec);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // 如果有 vn_m_s 和 ve_m_s，计算并填充 ground_speed 列
-                    for &(vn_col, ve_col, gs_col) in &ground_speed_cols {
-                        let vn_str = &row[vn_col];
-                        let ve_str = &row[ve_col];
-                        if let (Ok(vn), Ok(ve)) = (vn_str.parse::<f64>(), ve_str.parse::<f64>()) {
-                            row[gs_col] = format!("{:.6}", (vn * vn + ve * ve).sqrt());
-                        }
-                    }
-                    rows.push((ts, row));
+            })
+            .collect();
+
+        // 构建 evalexpr 上下文，注册 beijing_time 自定义函数
+        let fn_beijing_time = Function::new(|argument| {
+            if let Ok(f) = argument.as_float() {
+                Ok(Value::String(usec_to_beijing_time(f as u64)))
+            } else if let Ok(i) = argument.as_int() {
+                Ok(Value::String(usec_to_beijing_time(i as u64)))
+            } else {
+                Err(EvalexprError::expected_number(argument.clone()))
+            }
+        });
+
+        // 处理每一行
+        for i in 0..row_count {
+            let mut context = HashMapContext::new();
+            let _ = context.set_function("beijing_time".into(), fn_beijing_time.clone());
+
+            // 将消息中所有字段的值填入上下文
+            for (field_name, some_vec) in fields {
+                let val_str = some_vec_to_string(some_vec, i);
+                if let Ok(val) = val_str.parse::<f64>() {
+                    let _ = context.set_value(field_name.clone().into(), val.into());
                 }
             }
+
+            // 评估每条规则
+            let mut row: Vec<String> = Vec::with_capacity(rule_list.len());
+            for (j, rule) in rule_list.iter().enumerate() {
+                if rule.is_simple_ref {
+                    // 简单字段引用：直接使用原始字符串值（避免大整数精度丢失）
+                    let val = fields
+                        .get(&rule.expression)
+                        .map(|v| some_vec_to_string(v, i))
+                        .unwrap_or_default();
+                    row.push(val);
+                } else if let Some(ref node) = compiled[j] {
+                    match node.eval_with_context(&context) {
+                        Ok(Value::Float(f)) => row.push(format!("{:.6}", f)),
+                        Ok(Value::Int(n)) => row.push(n.to_string()),
+                        Ok(Value::String(s)) => row.push(s),
+                        Ok(v) => row.push(v.to_string()),
+                        Err(_) => row.push(String::new()),
+                    }
+                } else {
+                    row.push(String::new());
+                }
+            }
+
+            wtr.write_record(&row)
+                .map_err(|e| format!("写入数据行失败: {}", e))?;
         }
+
+        wtr.flush().map_err(|e| format!("刷新 CSV 失败: {}", e))?;
+        generated_files.push(csv_path.display().to_string());
     }
 
-    // 按 timestamp 排序后写入
-    rows.sort_by_key(|(ts, _)| *ts);
-    for (_, row) in rows {
-        wtr.write_record(&row)
-            .map_err(|e| format!("写入数据行失败: {}", e))?;
-    }
-
-    wtr.flush().map_err(|e| format!("刷新 CSV 失败: {}", e))?;
-    Ok(csv_path.display().to_string())
+    Ok(generated_files)
 }
